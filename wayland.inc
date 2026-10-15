@@ -14,20 +14,27 @@
 ;   wl_fb            dq  - pointer to the mapped pixel buffer (XRGB8888)
 ;   wl_width/wl_height/wl_stride  dd - geometry of that buffer
 ;   wl_present        - attach + damage + commit (shows the current pixels);
-;                       also requests a wl_surface.frame callback for pacing
+;                       also requests a wl_surface.frame callback for pacing.
+;                       Honors xdg_toplevel.configure: when the compositor
+;                       dictates a size (tiling WMs, maximized, etc.) the shm
+;                       buffer is transparently rebuilt to that size.
 ;   wl_wait_frame     - blocks until that frame callback fires (vsync)
 ;   wl_wait_release   - blocks until the compositor released the buffer
 ;   wl_dispatch       - flush, block for events, and process them once
 ;   wl_quit          dq  - set to 1 when the window should close
 ;
-; Rendering model: one buffer, single-buffered.  Draw into [wl_fb], call
-; wl_present, then wl_wait_frame + wl_wait_release before drawing the next
-; frame.  Loop until [wl_quit] is set (the window was closed).
+; Rendering model: one buffer, single-buffered.  Draw into [wl_fb] using the
+; current wl_width/wl_height, call wl_present, then wl_wait_frame +
+; wl_wait_release before drawing the next frame.  wl_width/wl_height always
+; match the live buffer, so honoring compositor resizes costs you nothing.
+; Loop until [wl_quit] is set (the window was closed).
 ; ---------------------------------------------------------------------------
 
 ; ------------------------------- syscalls ---------------------------------
 SYS_write         = 1
+SYS_close         = 3
 SYS_mmap          = 9
+SYS_munmap        = 11
 SYS_socket        = 41
 SYS_connect       = 42
 SYS_sendmsg       = 46
@@ -56,6 +63,8 @@ WL_SURFACE_FRAME             = 3
 WL_SURFACE_COMMIT            = 6
 WL_SHM_CREATE_POOL           = 0
 WL_SHM_POOL_CREATE_BUFFER    = 0
+WL_SHM_POOL_DESTROY          = 1
+WL_BUFFER_DESTROY            = 0
 XDG_WM_BASE_GET_XDG_SURFACE  = 2
 XDG_WM_BASE_PONG             = 3
 XDG_SURFACE_GET_TOPLEVEL     = 1
@@ -551,9 +560,28 @@ wl_ev_xdg_surface:
     ret
 
 ; xdg_toplevel.configure(iia) / close()
+; The compositor (especially a tiling WM) dictates the window size here.  We
+; record it and rebuild the shm buffer to match on the next wl_present, so the
+; surface fills whatever geometry the compositor gave us.
 wl_ev_toplevel:
     test ecx, ecx
-    jz  wl_ev_ret                  ; configure: geometry handled by compositor
+    jnz .wl_ev_toplevel_close
+    mov eax, [rdi]                 ; width
+    mov edx, [rdi + 4]             ; height
+    test eax, eax
+    jle wl_ev_ret                  ; 0 (or negative) = compositor has no opinion
+    test edx, edx
+    jle wl_ev_ret
+    cmp eax, [wl_width]
+    jne .wl_ev_toplevel_set
+    cmp edx, [wl_height]
+    je  wl_ev_ret                  ; unchanged
+.wl_ev_toplevel_set:
+    mov [wl_pending_w], eax
+    mov [wl_pending_h], edx
+    mov qword [wl_resize_pending], 1
+    ret
+.wl_ev_toplevel_close:
     mov qword [wl_quit], 1         ; close
     ret
 
@@ -675,6 +703,16 @@ wl_create_window:
 .wl_create_window_mapped:
     ; the ack_configure was queued while processing the configure event
     call wl_flush
+    ; if the compositor dictated a size in the first configure, use it now so
+    ; we allocate the buffer once, at the right size
+    cmp qword [wl_resize_pending], 0
+    je  .wl_create_window_size_ok
+    mov eax, [wl_pending_w]
+    mov [wl_width], eax
+    mov eax, [wl_pending_h]
+    mov [wl_height], eax
+    mov qword [wl_resize_pending], 0
+.wl_create_window_size_ok:
     call wl_create_shm_buffer
     ret
 
@@ -752,10 +790,55 @@ wl_create_shm_buffer:
     call wl_flush
     ret
 
+; --- rebuild the shm buffer at the current wl_width/wl_height --------------
+; Must run while the buffer is not busy (the frame loop waits for wl_buffer
+; release first).  The old memfd/mapping is safe to drop: the compositor holds
+; its own fd/mapping for the pages until it releases the old buffer.
+wl_resize_buffer:
+    mov rax, [wl_fb]
+    mov [wl_old_fb], rax
+    mov eax, [wl_shm_size]
+    mov [wl_old_size], eax
+    mov eax, [wl_shm_fd]
+    mov [wl_old_fd], eax
+    mov eax, [wl_pool_id]
+    mov [wl_old_pool], eax
+    mov eax, [wl_buffer_id]
+    mov [wl_old_buffer], eax
+
+    call wl_flush                  ; nothing else pending before the pool's fd
+    call wl_create_shm_buffer      ; allocates new fd/mapping/pool/buffer
+
+    mov eax, [wl_old_buffer]
+    begin_msg eax, WL_BUFFER_DESTROY
+    end_msg
+    mov eax, [wl_old_pool]
+    begin_msg eax, WL_SHM_POOL_DESTROY
+    end_msg
+    call wl_flush
+
+    mov eax, SYS_munmap
+    mov rdi, [wl_old_fb]
+    mov esi, [wl_old_size]
+    syscall
+    mov eax, SYS_close
+    mov edi, [wl_old_fd]
+    syscall
+    ret
+
 ; --- show the current contents of the framebuffer --------------------------
 ; Requests a wl_surface.frame callback (the vsync signal) for this commit, so
 ; wl_wait_frame can pace the next draw to the compositor's refresh.
 wl_present:
+    cmp qword [wl_resize_pending], 0
+    je  .wl_present_nosize
+    mov eax, [wl_pending_w]
+    mov [wl_width], eax
+    mov eax, [wl_pending_h]
+    mov [wl_height], eax
+    call wl_resize_buffer          ; new buffer now matches wl_width/wl_height
+    mov qword [wl_resize_pending], 0
+.wl_present_nosize:
     call wl_alloc_id
     mov [wl_frame_cb], eax
     mov qword [wl_frame_done], 0
@@ -844,6 +927,15 @@ wl_stride        dd 0
 wl_shm_fd        dd 0
 wl_shm_size      dd 0
 wl_fb            dq 0
+
+wl_pending_w     dd 0
+wl_pending_h     dd 0
+wl_resize_pending dq 0
+wl_old_fb        dq 0
+wl_old_size      dd 0
+wl_old_fd        dd 0
+wl_old_pool      dd 0
+wl_old_buffer    dd 0
 
 wl_quit          dq 0
 wl_sync_done     dq 0
